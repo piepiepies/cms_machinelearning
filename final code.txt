@@ -1,0 +1,356 @@
+#eda portion of the 6 years amount of data from cms
+#install the libaries:
+pip3 install requests
+pip3 install boto3
+pip3 install pandas
+pip3 install pyarrow
+
+#IMPORTING THE NECESSARY MODULES AND NAMING THEM
+#USE A R EC2 INSTANCE TYPE
+import json
+import requests
+import pandas as pd
+import boto3
+import math
+import numpy as np
+import _pickle as cPickle 
+import pyarrow
+
+s3_client = boto3.client('s3')
+s3_resource = boto3.resource('s3')
+
+#download the csv files from link for each year between 2020 and 2015, inclusive, and put them into a s3 bucket
+#https://data.cms.gov/provider-summary-by-type-of-service/medicare-physician-other-practitioners/medicare-physician-other-practitioners-by-provider-and-service/data
+
+#getting the name of each csv file
+physicians_and_others = []
+for key in s3_client.list_objects(Bucket='project-data-rz-new-xlsx')['Contents']:
+    physicians_and_others.append(key['Key'])
+
+#creating a function to turn the csv files into dataframe and concatenate them
+def concatList(compiled_list):
+    physicians_and_others_dfs = []
+    for each_year in compiled_list:
+        df = pd.read_csv('s3a://project-data-rz-new-xlsx/'+ each_year, encoding='latin-1')
+        physicians_and_others_dfs.append(df)
+    return physicians_and_others_dfs
+
+physicians_and_others_dfs = concatList(physicians_and_others)
+
+phy_concat_df = pd.concat(physicians_and_others_dfs)
+
+
+#making a pikl file for the concatenated dataframe
+df_pikl_dict = {"phy_concat_df":physicians_and_others_dfs}
+
+for name, dfs in df_pikl_dict.items():
+	locals()[name] = pd.concat(dfs, ignore_index=True)
+	locals()[name].to_pickle(name + ".pkl")
+	s3_client.upload_file(name + ".pkl", "rz-data-progress", name + "_pkl")
+
+#cleaning the data and saving the columns i need 
+phy_df_mod = phy_concat_df[['Rndrng_NPI', 'Rndrng_Prvdr_City', 'Rndrng_Prvdr_State_Abrvtn', 'Rndrng_Prvdr_Cntry', 'Tot_Benes', \
+'Tot_Srvcs', 'Avg_Sbmtd_Chrg', 'Avg_Mdcr_Alowd_Amt', 'Avg_Mdcr_Pymt_Amt']].copy()
+phy_df_mod['Rndrng_NPI'] = phy_df_mod['Rndrng_NPI'].astype(str)
+
+#EDA for for 6 years of concatenated data
+def eda_functions(df):
+    df.info()
+    print("--------------")
+    print("shape is" + " "+ str(df.shape))
+    print("--------------")
+    print("size is" + " "+str(df.size))
+    print("--------------")
+    print(df.describe())
+    print("--------------")
+    print(df.isnull().sum())
+    print("--------------")
+    print("total null values are" + " "+ str(df.isnull().sum().sum()))
+
+eda_functions(phy_df_mod)
+
+#############################################################################################################
+#feature engineering in pyspark portion
+#installing the libriaries
+pip3 install requests
+pip3 install boto3
+pip3 install pandas
+
+#importing the libraries
+import json
+import requests
+import pandas as pd
+import boto3
+import math
+import _pickle as cPickle 
+
+s3_client = boto3.client('s3')
+s3_resource = boto3.resource('s3')
+
+from pyspark.sql.functions import * 
+from pyspark.sql.types import *
+
+#creating the list to get the names of the csv files in s3 bucket
+csv_list = []
+for key in s3_client.list_objects(Bucket='project-data-rz-new-xlsx')['Contents']:
+    csv_list.append(key['Key'])
+
+
+#function to create spark dataframes for each of the csv and put them in a list
+def concatList(compiled_list):
+    physicians_and_others_sdfs = []
+    for each_year in compiled_list:
+        sdf = spark.read.options(header=True,inferSchema=True).csv('s3a://project-data-rz-new-xlsx/'+ each_year)
+        physicians_and_others_sdfs.append(sdf)
+    return physicians_and_others_sdfs
+
+physicians_and_others_sdfs = concatList(csv_list)
+
+#function to select the columns i need for each of the spark dataframes
+def sdf_mod(sdf_list):
+    sdf_modded_list = []
+    for spark_df in sdf_list:
+        sdf_new = spark_df.select('Rndrng_NPI', 'Rndrng_Prvdr_City', 'Rndrng_Prvdr_State_Abrvtn', 'Rndrng_Prvdr_Cntry', 'Tot_Benes', 
+                             'Tot_Srvcs', 'Avg_Sbmtd_Chrg', 'Avg_Mdcr_Alowd_Amt', 'Avg_Mdcr_Pymt_Amt')
+        sdf_new = sdf_new.withColumn('Rndrng_NPI', sdf_new['Rndrng_NPI'].cast(StringType()))
+        sdf_new.printSchema()
+        sdf_modded_list.append(sdf_new)
+        print('i added a new one')
+    return sdf_modded_list
+
+sdf_modded_list = sdf_mod(physicians_and_others_sdfs)
+
+
+#function to create the the columns i need: total paid by medicare, total submitted to medicare, and total allowed by medicare
+def sdfCleaning(modded_list):
+    cleaned_list = []
+    #removing the non-US states
+    phy_non_na = ['XX', 'AA', 'AE', 'AP', 'AS', 'GU', 'MP', 'PR', 'VI', 'ZZ']
+    for modded_sdf in modded_list:
+        no_null_sdf = modded_sdf.where((~modded_sdf.Rndrng_Prvdr_State_Abrvtn.isin(phy_non_na)) 
+                                     & (modded_sdf.Rndrng_Prvdr_Cntry == 'US'))
+        #calculations for the total paid, the total submitted, and total allowed
+        calculated_sdf = no_null_sdf.withColumn('total_paid', no_null_sdf['Tot_Srvcs'] * no_null_sdf['Avg_Mdcr_Pymt_Amt']).\
+        withColumn('total_submitted', no_null_sdf['Tot_Srvcs'] * no_null_sdf['Avg_Sbmtd_Chrg']).\
+        withColumn('total_allowed', no_null_sdf['Tot_Srvcs'] * no_null_sdf['Avg_Mdcr_Pymt_Amt'])
+        #finding out the distinct amount of doctors in each state 
+        calculated_sdf0 = calculated_sdf.groupBy('Rndrng_Prvdr_State_Abrvtn').agg(countDistinct('Rndrng_NPI').alias('doctors'))
+        calculated_sdf1 = calculated_sdf.join(calculated_sdf0, 'Rndrng_Prvdr_State_Abrvtn')
+        #calculating and joining the grouped results together for each state
+        calculated_sdf1_0 = calculated_sdf1.groupBy('Rndrng_Prvdr_State_Abrvtn', 
+                                  'Tot_Benes', 'doctors').agg(sum('total_paid').alias('physicians_others_total_paid'))
+        calculated_sdf1_1 = calculated_sdf1.groupBy('Rndrng_Prvdr_State_Abrvtn', 
+                                  'Tot_Benes', 'doctors').agg(sum('total_submitted').alias('physicians_others_submitted'))
+        calculated_sdf1_2 = calculated_sdf1.groupBy('Rndrng_Prvdr_State_Abrvtn', 
+                                  'Tot_Benes', 'doctors').agg(sum('total_allowed').alias('physicians_others_allowed'))
+        calculated_main = calculated_sdf1_0.join(calculated_sdf1_1, ['Rndrng_Prvdr_State_Abrvtn', 'Tot_Benes', 'doctors']).\
+        join(calculated_sdf1_2, ['Rndrng_Prvdr_State_Abrvtn', 'Tot_Benes', 'doctors'])
+        #removed one last area that's not an US state
+        calculated_main = calculated_main.where(~ (calculated_main.Rndrng_Prvdr_State_Abrvtn == 'PW'))
+        cleaned_list.append(calculated_main)
+    return cleaned_list
+
+sdf_cleaned_list = sdfCleaning(sdf_modded_list)
+
+#checking the toatl amount of rows in all the spark dataframes
+row_count = 0
+for cleaned_sdf in sdf_cleaned_list:
+    row_count += cleaned_sdf.count()
+
+print(row_count)
+
+#concatenating the spark dataframes together and checking the total amount of rows
+counter = 0
+while counter < len(sdf_cleaned_list):
+    if counter == 0:
+        result_sdf = sdf_cleaned_list[counter].union(sdf_cleaned_list[counter+1])
+        counter += 2
+    else:
+        result_sdf = result_sdf.union(sdf_cleaned_list[counter])
+        counter += 1
+
+result_sdf.count()
+
+#making sure the total amount of states is 51 (including Washington D.C.)
+result_sdf.select(countDistinct('Rndrng_Prvdr_State_Abrvtn')).show()
+#51
+
+#seeing if there are duplicated rows for my features
+check_df = result_sdf.groupBy('Rndrng_Prvdr_State_Abrvtn', 'Tot_Benes', 'doctors').count()
+check_df.where(col('count') > 1).count()
+
+#saving this spark dataframe
+result_sdf.write.parquet('s3a://rz-data-progress/phy_sdf_nofeat.parquet')
+
+
+#############################################################################################################
+#pyspark portion for machine learning
+#used 8 r6a.xlarge instances cluster (1 driver, 7 nodes)
+
+#changing the cluster configurations
+import pyspark
+
+#configuration changes made based on guide:
+#https://aws.amazon.com/blogs/big-data/best-practices-for-successfully-managing-memory-for-apache-spark-applications-on-amazon-emr/
+conf = pyspark.SparkConf().setAll([("maximizeResourceAllocation", "true"), ("spark.executor.cores", "4"),\
+                                   ("spark.executor.memory", "20000M"), ("spark.executor.memoryOverhead", "3000M"),\
+                                   ("spark.driver.memory", "20000M"), ("spark.driver.cores","4"),\
+                                   ("spark.executor.instances","6"), ("spark.default.parallelism","48"),
+                                   ("spark.executor.extraJavaOptions","-XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SummarizeConcMark -XX:InitiatingHeapOccupancyPercent=35 -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:OnOutOfMemoryError='kill -9 %p'"),\
+                                   ("spark.driver.extraJavaOptions", "-XX:+UseG1GC -XX:+UnlockDiagnosticVMOptions -XX:+G1SummarizeConcMark -XX:InitiatingHeapOccupancyPercent=35 -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:OnOutOfMemoryError='kill -9 %p'"),\
+                                   ("spark.dynamicAllocation.enabled", "false")
+                                  ])
+
+sc.stop()
+sc = pyspark.SparkContext(conf=conf)
+spark = SparkSession(sc)
+
+#import the necessary modules 
+from pyspark.sql.functions import *
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, OneHotEncoder 
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import *
+from pyspark.ml.tuning import *
+import numpy as np
+
+#load the parquet file
+phy_df_main = spark.read.parquet('s3a://rz-data-progress/phy_sdf_nofeat.parquet')
+
+#feature creation
+phy_df_main = phy_df_main.withColumn('label', phy_df_main['physicians_others_total_paid'])
+
+#creating the training and testing data sets
+trainingData, testData = phy_df_main.randomSplit([0.7, 0.3], seed=789789)
+
+#indexer for the states column
+indexer = StringIndexer(inputCol='Rndrng_Prvdr_State_Abrvtn', outputCol="stateIndex")
+
+#encoder
+encoder = OneHotEncoder(inputCols = ['stateIndex'], outputCols = ['stateVector'], dropLast = False, handleInvalid = 'keep')
+
+#assembler 
+assembler = VectorAssembler(inputCols=['stateVector', 'Tot_Benes', 'doctors'], outputCol ='features')
+
+
+#linear regression, 55 iterations
+regression = LinearRegression(maxIter=55)
+
+#pipeline
+phy_pipe= Pipeline(stages=[indexer, encoder, assembler, regression])
+
+#parameter grid
+grid = ParamGridBuilder()
+grid = grid.addGrid(regression.regParam, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+grid = grid.addGrid(regression.elasticNetParam, [0, 0.5, 1])
+grid = grid.build()
+
+#creating the evaluators
+modelEvaluator = RegressionEvaluator(metricName='rmse')
+
+#creating the crossvalidator
+cv = CrossValidator(estimator=phy_pipe, estimatorParamMaps=grid, evaluator=modelEvaluator, numFolds=3, seed=789)
+
+#train the models
+cvModel = cv.fit(trainingData)
+
+#save the model
+model_path = "s3a://rz-data-progress/linear_regression_model"
+cvModel.write().overwrite().save(model_path)
+print('im done')
+
+#read it back in later
+cvModel = LinearRegressionModel.load(model_path)
+
+#predictions
+predictions = cvModel.transform(testData)
+
+
+#model evaluation portion
+#showing the results
+predictions.select('Rndrng_Prvdr_State_Abrvtn', 'Tot_Benes', 'doctors', 'prediction', 'label').show(10)
+
+#18 models
+print(len(cvModel.avgMetrics))
+
+#average of each of the 18 models from the parameters between the 3 folds
+for metrics in cvModel.avgMetrics:
+	print(metrics)
+
+#rmse of the best model
+rmse = modelEvaluator.evaluate(predictions)
+
+#r2 of the best model
+r2evaluator = RegressionEvaluator(metricName='r2')
+r2=r2evaluator.evaluate(predictions)
+print(r2)
+
+#############################################################################################################
+#visualization portion
+#download the parquet file onto jupyter notebook
+
+#installing pyarrow to read the parquet file
+pip install pyarrow
+
+#importing the necessary libraries
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import pyarrow
+
+#reading the parquet file into a dataframe
+df = pd.read_parquet('sdf_nofeat.parquet')
+
+#getting the info for this dataframe with features
+df.info()
+
+#visualization 1
+df1_0 = df.groupby('Rndrng_Prvdr_State_Abrvtn')['physicians_others_total_paid'].sum()
+df1_1 = pd.DataFrame({'states':df1_0.index, 'paid':df1_0.values})
+fig, ax = plt.subplots(figsize=(15, 15))
+sns.barplot(
+x='states',
+y='paid',
+data = df1_1)
+
+plt.xlabel('State', size = 10)
+plt.ylabel('Paid by Medicare', size = 10)
+plt.title('Total Paid per State from 2015-2020', size = 10)
+plt.savefig('Total Paid Per State.png')
+
+#visualization 2
+df1_0 = df.groupby('Rndrng_Prvdr_State_Abrvtn')['physicians_others_submitted'].sum()
+df1_1 = pd.DataFrame({'states':df1_0.index, 'submitted':df1_0.values})
+fig, ax = plt.subplots(figsize=(15, 15))
+sns.barplot(
+x='states',
+y='submitted',
+data = df1_1)
+
+plt.xlabel('State', size = 10)
+plt.ylabel('Submitted to Medicare', size = 10)
+plt.title('Total Submitted per State from 2015-2020', size = 10)
+plt.savefig('Total Submitted Per State.png')
+
+#visualization 3
+fig, ax = plt.subplots(figsize=(20, 20))
+sns.scatterplot(
+x='Tot_Benes',
+y='physicians_others_total_paid',hue ='Rndrng_Prvdr_State_Abrvtn',
+data = df)
+plt.xlabel('Beneficiaries', size = 10)
+plt.ylabel('Amount Paid by Medicare', size = 10)
+plt.title('Beneficiaries and State vs Total Paid', size = 10)
+plt.savefig('Beneficiaries and State vs Total Paid.png')
+
+#visualization 4
+fig, ax = plt.subplots(figsize=(20, 20))
+sns.scatterplot(
+x='doctors',
+y='physicians_others_total_paid',hue ='Rndrng_Prvdr_State_Abrvtn',
+data = df)
+plt.xlabel('Doctors', size = 10)
+plt.ylabel('Amount Paid by Medicare', size = 10)
+plt.title('Doctors and State vs Total Paid', size = 10)
+plt.savefig('Doctors and State vs Total Paid.png')
