@@ -12,7 +12,7 @@ The predictions result from the machine learning model is in the predictions tex
 There are four visualizations as well.
 
 The linear regression model was awful with the predictor variables selected:
-RMSE is extremely high in proportion to the paid amounts
-R^2 value is only around 4%
+RMSE is extremely high in proportion to the paid amounts.
+R^2 value is only around 4%.
 
 
